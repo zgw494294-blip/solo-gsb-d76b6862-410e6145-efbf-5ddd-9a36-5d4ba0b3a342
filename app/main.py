@@ -17,6 +17,7 @@ from .isolation import (
     VersionConflictError,
     create_job,
     get_snapshot,
+    revise_demands,
     toggle_pipe,
 )
 from .solver import (
@@ -216,6 +217,38 @@ async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
         "ok": True,
         "toggled_pipe": pipe_id,
         "toggled_to": "closed" if pipe_id in snapshot["closed_pipes"] else "open",
+        "job": snapshot,
+    })
+
+
+@app.post("/api/isolation-jobs/{job_id}/revise-demands")
+async def revise_isolation_demands(job_id: str, request: Request) -> JSONResponse:
+    """携带当前版本修订一个或多个现有用水节点的需水量，无需重建作业。
+
+    请求体 {"version", "changes": [{"node_id", "demand"}, ...]}：只改列出的
+    节点，按当前关闭集合重算（连通节点不得欠压，失供节点保存新值并更新失供
+    总量）；成功才提交新需水量、完整快照与版本 +1。修订与切换共用版本乐观锁，
+    同一版本合计最多成功一次，落后提交返回 409 与 current_version。
+
+    重算在工作线程进行，不阻塞事件循环：计算期间该作业的读取返回最近已提交
+    快照（含按节点录入顺序的全部当前需水量 demands），其他作业与健康检查照常。
+    """
+    payload, bad = await _load_payload(
+        request,
+        empty_hint="请求体为空，请提供 version（作业当前版本号）与非空 changes"
+                   "（每项含 node_id 与 demand 的修订列表）。")
+    if bad is not None:
+        return bad
+    try:
+        snapshot, revised = await run_in_threadpool(
+            revise_demands, job_id, payload)
+    except _ISOLATION_ERRORS as exc:
+        return _isolation_error(exc)
+    return JSONResponse(content={
+        "ok": True,
+        "revised_nodes": revised,
+        "revised_demands": [item for item in snapshot["demands"]
+                            if item["id"] in revised],
         "job": snapshot,
     })
 
